@@ -6,16 +6,22 @@ Run it on a machine with a camera and display:
     python app.py --model path/to/hand_landmarker.task
     python app.py --camera 1 --num-hands 2
 
+It also loads a trained classifier and shows the predicted ASL letter (A-Z) for
+each detected hand. By default it uses the neural network (neural_network/asl_mlp.joblib)
+and falls back to the logistic-regression model if the neural net is missing.
+Use --classifier to point at any other .joblib model.
+
 Controls: press 'q' or ESC to quit.
 
-Requires: mediapipe, opencv-python, numpy.
-    pip install mediapipe opencv-python numpy
+Requires: mediapipe, opencv-python, numpy, scikit-learn, joblib.
+    pip install mediapipe opencv-python numpy scikit-learn joblib
 """
 
 from __future__ import annotations
 
 import argparse
 import time
+import warnings
 from pathlib import Path
 
 import cv2
@@ -40,6 +46,16 @@ MODEL_CANDIDATES = [
     Path(__file__).resolve().parent / "hand_landmarker.task",
     Path.home() / "datasets" / "hand_landmarker.task",
     Path.home() / "hand-pose" / "models" / "hand_landmarker.task",
+]
+
+# Trained classifiers, in priority order. The neural network is the default;
+# the logistic-regression model is the fallback.
+_HERE = Path(__file__).resolve().parent
+CLASSIFIER_CANDIDATES = [
+    _HERE / "neural_network" / "asl_mlp.joblib",
+    _HERE / "asl_mlp.joblib",
+    _HERE / "logistic_regression" / "asl_logreg.joblib",
+    _HERE / "asl_logreg.joblib",
 ]
 
 
@@ -71,7 +87,44 @@ def make_landmarker(model_path: str, num_hands: int):
     return mp_vision.HandLandmarker.create_from_options(options)
 
 
-def draw_hands(frame: np.ndarray, result) -> None:
+def load_classifier(explicit: str | None):
+    """Load the ASL classifier (neural net by default), or None if unavailable."""
+    if explicit:
+        path = Path(explicit)
+        if not path.is_file():
+            print(f"note: classifier not found at {path} - letters will not be shown")
+            return None
+    else:
+        path = next((c for c in CLASSIFIER_CANDIDATES if c.is_file()), None)
+        if path is None:
+            print("note: no classifier (.joblib) found - letters will not be shown")
+            return None
+    try:
+        import joblib
+    except ImportError:
+        print("note: joblib/scikit-learn not installed - letters will not be shown "
+              "(pip install scikit-learn joblib)")
+        return None
+    clf = joblib.load(path)
+    kind = type(clf).__name__
+    print(f"using classifier: {path.name} ({kind})  classes: {''.join(clf.classes_)}")
+    return clf
+
+
+def predict_letter(clf, lm) -> tuple[str, float] | None:
+    """Map 21 landmarks (x, y, z each) to a letter using the classifier."""
+    if clf is None:
+        return None
+    # Feature order matches the notebook: x0, y0, z0, x1, y1, z1, ... x20, y20, z20.
+    feats = np.array([[c for p in lm for c in (p.x, p.y, p.z)]], dtype=np.float32)
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")  # model was fit on named columns; array is fine
+        letter = str(clf.predict(feats)[0])
+        score = float(clf.predict_proba(feats).max()) if hasattr(clf, "predict_proba") else 0.0
+    return letter, score
+
+
+def draw_hands(frame: np.ndarray, result, clf=None) -> None:
     h, w = frame.shape[:2]
     hands = getattr(result, "hand_landmarks", None) or []
     handedness = getattr(result, "handedness", None) or []
@@ -94,10 +147,24 @@ def draw_hands(frame: np.ndarray, result) -> None:
             cv2.putText(frame, label, (pts[0][0] - 10, pts[0][1] - 15),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
 
+        pred = predict_letter(clf, lm)
+        if pred is not None:
+            letter, score = pred
+            text = f"{letter} {score:.2f}"
+            x = max(pts[9][0] - 20, 10)   # near the middle-finger base
+            y = max(min(pts[9][1], frame.shape[0] - 10), 40)
+            cv2.putText(frame, text, (x, y),
+                        cv2.FONT_HERSHEY_SIMPLEX, 1.2, (0, 0, 0), 6)
+            cv2.putText(frame, text, (x, y),
+                        cv2.FONT_HERSHEY_SIMPLEX, 1.2, (0, 255, 255), 2)
+
 
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--model", default=None, help="path to hand_landmarker.task")
+    parser.add_argument("--classifier", default=None,
+                        help="path to a .joblib model (default: neural_network/asl_mlp.joblib, "
+                             "falls back to the logistic-regression model)")
     parser.add_argument("--camera", type=int, default=0, help="webcam index")
     parser.add_argument("--num-hands", type=int, default=2)
     parser.add_argument("--width", type=int, default=1280)
@@ -106,6 +173,7 @@ def main() -> None:
 
     model_path = locate_model(args.model)
     print(f"using model: {model_path}")
+    classifier = load_classifier(args.classifier)
 
     cap = cv2.VideoCapture(args.camera)
     cap.set(cv2.CAP_PROP_FRAME_WIDTH, args.width)
@@ -131,7 +199,7 @@ def main() -> None:
             timestamp_ms = int((time.time() - start) * 1000)
             result = landmarker.detect_for_video(mp_image, timestamp_ms)
 
-            draw_hands(frame, result)
+            draw_hands(frame, result, classifier)
 
             now = time.time()
             fps = 0.9 * fps + 0.1 * (1.0 / max(now - prev, 1e-6))
